@@ -1,16 +1,20 @@
 import {
+  AttributeValue,
   BatchGetItemCommand,
+  BatchGetItemCommandOutput,
   DynamoDBClient,
-  GetItemCommand,
+  KeysAndAttributes,
 } from "@aws-sdk/client-dynamodb";
 import {
   ListObjectsV2Command,
+  ListObjectsV2CommandOutput,
   S3Client,
   paginateListObjectsV2,
 } from "@aws-sdk/client-s3";
 import {
+  BatchGetCommand,
+  BatchGetCommandOutput,
   DynamoDBDocumentClient,
-  GetCommand,
   QueryCommand,
 } from "@aws-sdk/lib-dynamodb";
 
@@ -22,22 +26,56 @@ const doc = DynamoDBDocumentClient.from(ddb); // ok: module-level client
 const s3 = new S3Client({}); // ok: module-level client
 
 export const handler = async (event: any) => {
-  const client = new DynamoDBClient({}); // smell: CS-004
-  const carts = [];
-  for (const cartId of event.cartIds as string[]) {
-    const res = await client.send(new GetItemCommand({ TableName: CARTS_TABLE, Key: { cart_id: { S: cartId } } })); // smell: CS-001
-    carts.push(res.Item);
+  const cartIds = event.cartIds as string[];
+  const uniqueIds = Array.from(new Set(cartIds));
+  const found = new Map<string, Record<string, AttributeValue>>();
+  for (let i = 0; i < uniqueIds.length; i += 100) {
+    const chunk = uniqueIds.slice(i, i + 100);
+    let requestItems: Record<string, KeysAndAttributes> | undefined = {
+      [CARTS_TABLE]: { Keys: chunk.map((id) => ({ cart_id: { S: id } })) },
+    };
+    while (requestItems && Object.keys(requestItems).length > 0) {
+      const res: BatchGetItemCommandOutput = await ddb.send(new BatchGetItemCommand({ RequestItems: requestItems }));
+      for (const item of res.Responses?.[CARTS_TABLE] ?? []) {
+        const id = item.cart_id?.S;
+        if (id !== undefined) found.set(id, item);
+      }
+      requestItems = res.UnprocessedKeys;
+    }
   }
+  const carts = cartIds.map((cartId) => found.get(cartId));
   return { statusCode: 200, body: JSON.stringify(carts) };
 };
 
 export async function loadCartItems(ids: string[]) {
-  return Promise.all(ids.map((id) => doc.send(new GetCommand({ TableName: CARTS_TABLE, Key: { cart_id: id } })))); // smell: CS-001
+  const uniqueIds = Array.from(new Set(ids));
+  const found = new Map<string, Record<string, any>>();
+  for (let i = 0; i < uniqueIds.length; i += 100) {
+    const chunk = uniqueIds.slice(i, i + 100);
+    let requestItems: Record<string, any> | undefined = {
+      [CARTS_TABLE]: { Keys: chunk.map((id) => ({ cart_id: id })) },
+    };
+    while (requestItems && Object.keys(requestItems).length > 0) {
+      const res: BatchGetCommandOutput = await doc.send(new BatchGetCommand({ RequestItems: requestItems }));
+      for (const item of res.Responses?.[CARTS_TABLE] ?? []) {
+        const id = item.cart_id;
+        if (id !== undefined) found.set(String(id), item);
+      }
+      requestItems = res.UnprocessedKeys as Record<string, any> | undefined;
+    }
+  }
+  return ids.map((id) => ({ Item: found.get(id) }));
 }
 
 export async function listReceipts() {
-  const res = await s3.send(new ListObjectsV2Command({ Bucket: RECEIPT_BUCKET })); // smell: CS-003
-  return (res.Contents ?? []).map((obj) => obj.Key);
+  const keys: (string | undefined)[] = [];
+  let continuationToken: string | undefined;
+  do {
+    const res: ListObjectsV2CommandOutput = await s3.send(new ListObjectsV2Command({ Bucket: RECEIPT_BUCKET, ContinuationToken: continuationToken }));
+    keys.push(...(res.Contents ?? []).map((obj) => obj.Key));
+    continuationToken = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return keys;
 }
 
 export async function loadCartsBatched(ids: string[]) {

@@ -5,29 +5,33 @@ import { CosmosClient, OperationInput } from "@azure/cosmos";
 const cosmos = new CosmosClient(process.env.COSMOS_CONNECTION_STRING ?? ""); // ok: module-level client
 const container = cosmos.database("shop").container("invoices");
 
+const blobService = BlobServiceClient.fromConnectionString(process.env.STORAGE_CONNECTION_STRING ?? "");
+const containerClient = blobService.getContainerClient("invoices");
+
+function uploadInvoice(invoice: { id: string; pdf: string }) {
+  const body = invoice.pdf;
+  return containerClient.getBlockBlobClient(`${invoice.id}.pdf`).upload(body, body.length);
+}
+
 export async function saveInvoices(request: HttpRequest, context: InvocationContext) {
-  const blobService = BlobServiceClient.fromConnectionString(process.env.STORAGE_CONNECTION_STRING ?? ""); // smell: CS-004
-  const containerClient = blobService.getContainerClient("invoices");
   const invoices = (await request.json()) as { id: string; pdf: string }[];
-  for (const invoice of invoices) {
-    const body = invoice.pdf;
-    await containerClient.getBlockBlobClient(`${invoice.id}.pdf`).upload(body, body.length); // smell: CS-001
-  }
+  // Blob Storage has no batch upload API; upload concurrently instead of one round trip after another.
+  await Promise.all(invoices.map(uploadInvoice));
   context.log(`saved ${invoices.length} invoices`);
   return { status: 200 };
 }
 
 export async function loadInvoices(ids: string[]) {
-  const invoices = [];
-  for (const id of ids) {
-    const { resource } = await container.item(id, id).read(); // smell: CS-001
-    invoices.push(resource);
+  if (ids.length === 0) {
+    return [];
   }
-  return invoices;
+  const operations: OperationInput[] = ids.map((id) => ({ operationType: "Read", id, partitionKey: id }));
+  const responses = await container.items.bulk(operations, { continueOnError: true });
+  return responses.map((response) => response.resourceBody);
 }
 
 export async function firstInvoices() {
-  const { resources } = await container.items.query("SELECT * FROM c").fetchNext(); // smell: CS-003
+  const { resources } = await container.items.query("SELECT * FROM c").fetchAll();
   return resources;
 }
 
